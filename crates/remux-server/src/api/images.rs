@@ -52,6 +52,80 @@ async fn fetch_upstream(url: &str) -> anyhow::Result<(Vec<u8>, String)> {
     Ok((bytes, ct))
 }
 
+/// Resolve a Backdrop image from an item's ancestor chain (series, then
+/// season) when the item itself — an Episode or Season — has no backdrop
+/// of its own.
+///
+/// This exists because episodes usually have no dedicated backdrop image;
+/// the Jellyfin-compatible DTO already exposes `ParentBackdropItemId` /
+/// `ParentBackdropImageTags` so well-behaved clients (e.g. the web UI) can
+/// request the series' backdrop directly by its own ID. Infuse (tvOS),
+/// however, requests the episode's own `/Items/{id}/Images/Backdrop`
+/// endpoint regardless, so the server needs to resolve the fallback itself
+/// here rather than 404ing.
+///
+/// Deliberately scoped to Backdrop + Episode/Season only — do not widen
+/// this to other image types or item kinds, since the web UI already gets
+/// correct fallback behavior from the DTO fields for those and does not
+/// need (or expect) this endpoint to change behavior for them.
+async fn resolve_backdrop_ancestor(
+    state: &AppState,
+    media: &db::Media,
+) -> Result<Option<(Vec<u8>, String, String, bool)>> {
+    let ancestor_ids: Vec<Uuid> = match media.kind {
+        db::MediaKind::Episode => vec![media.grandparent_id, media.parent_id]
+            .into_iter()
+            .flatten()
+            .collect(),
+        db::MediaKind::Season => vec![media.parent_id]
+            .into_iter()
+            .flatten()
+            .collect(),
+        _ => Vec::new(),
+    };
+
+    for ancestor_id in ancestor_ids {
+        let ancestor = db::Media::get_by_id(
+            &state
+                .ctx
+                .db,
+            &ancestor_id,
+        )
+        .await?;
+
+        if let Some(ancestor) = ancestor {
+            if let Some(img) = ancestor
+                .images
+                .get(ImageKind::Backdrop)
+            {
+                let source_key = img
+                    .id
+                    .to_string();
+                let resolved = if img
+                    .path
+                    .starts_with('/')
+                {
+                    let path = std::path::PathBuf::from(&img.path);
+                    let (b, ct) = ImageService::serve_local(&path)
+                        .await
+                        .context_not_found("image file not found")?;
+                    (b, ct.to_string(), source_key, false)
+                } else {
+                    // Always proxy external URLs rather than redirecting — some clients
+                    // (e.g. Infuse) do not follow redirects for image requests.
+                    let (b, ct) = fetch_upstream(&img.path)
+                        .await
+                        .context_not_found("image fetch failed")?;
+                    (b, ct, source_key, true)
+                };
+                return Ok(Some(resolved));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
 async fn items_images_inner(
     state: AppState,
     id: Uuid,
@@ -116,6 +190,15 @@ async fn items_images_inner(
                         }
                     });
 
+                let backdrop_fallback = if img_row.is_none()
+                    && image_type == api::ImageType::Backdrop
+                    && matches!(media.kind, db::MediaKind::Episode | db::MediaKind::Season)
+                {
+                    resolve_backdrop_ancestor(&state, &media).await?
+                } else {
+                    None
+                };
+
                 if let Some(img) = img_row {
                     let source_key = img
                         .id
@@ -137,6 +220,8 @@ async fn items_images_inner(
                             .context_not_found("image fetch failed")?;
                         (b, ct, source_key, true)
                     }
+                } else if let Some(fallback) = backdrop_fallback {
+                    fallback
                 } else if matches!(
                     image_type,
                     api::ImageType::Primary | api::ImageType::Thumb
